@@ -1,0 +1,17 @@
+[package]
+name = "expect"
+version = "0.1.0"
+authors = ["Corentin Henry <corentinhenry@gmail.com>"]
+
+[dependencies]
+tokio-core = "0.1.12"
+tokio-io = "0.1.4"
+tokio-process = "0.1.5"
+futures = "0.1.17"
+tokio-timer = "0.1.2"
+regex = "0.2.5"
+log = "0.4.1"
+bytes = "0.4.6"
+
+[dev-dependencies]
+env_logger = "0.4.3"

@@ -1,30 +1,31 @@
-#[macro_use] extern crate log;
-extern crate bytes;
 extern crate futures;
+extern crate libc;
+#[macro_use]
+extern crate log;
+extern crate mio;
 extern crate regex;
 extern crate tokio_core;
 extern crate tokio_io;
-extern crate tokio_process;
+// extern crate pty;
+extern crate tty;
 
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Read, Write};
 use std::collections::VecDeque;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
-
-use bytes::Buf;
-use bytes::BytesMut;
 
 use futures::{Async, Canceled, Future, Poll, Stream};
 use futures::sync::{mpsc, oneshot};
 
 use regex::Regex;
 
-use tokio_process::{Child, ChildStderr, ChildStdin, ChildStdout, CommandExt};
-use tokio_io::{codec, AsyncWrite};
 use tokio_core::reactor::Handle as TokioHandle;
 use tokio_core::reactor::Timeout;
+
+mod pty;
+use pty::*;
 
 #[derive(Debug, Clone)]
 pub enum Match {
@@ -56,25 +57,12 @@ impl PartialEq for Match {
 
 struct InputRequest(Vec<u8>, oneshot::Sender<()>);
 
-struct ActiveInputRequest(Cursor<Vec<u8>>, oneshot::Sender<()>);
-
-impl From<InputRequest> for ActiveInputRequest {
-    fn from(req: InputRequest) -> Self {
-        ActiveInputRequest(Cursor::new(req.0), req.1)
-    }
-}
-
 pub struct Session {
     /// A tokio core handle used to spawn asynchronous tasks.
     handle: TokioHandle,
 
-    /// process we're interacting with
-    #[allow(dead_code)]
-    process: Child,
-    /// process stdin async writer
-    stdin: ChildStdin,
     /// process stdout async reader
-    stdout: ChildStdout,
+    pty: Pty,
 
     /// buffer where we store bytes read from stdout
     buffer: Vec<u8>,
@@ -83,7 +71,7 @@ pub struct Session {
     input_requests_rx: mpsc::UnboundedReceiver<InputRequest>,
     /// FIFO storage for the input requests. Requests are processed one after another, not
     /// concurrently.
-    input_requests: VecDeque<ActiveInputRequest>,
+    input_requests: VecDeque<InputRequest>,
 
     /// Receiver for the matching requests coming from the expect handle.
     match_requests_rx: mpsc::UnboundedReceiver<MatchRequest>,
@@ -134,8 +122,8 @@ pub enum MatchError {
 impl Error for MatchError {
     fn description(&self) -> &str {
         match *self {
-            MatchError::Eof => "met unexpected EOF while reading stdout",
-            MatchError::Timeout => "timeout while trying to find matches in stdout",
+            MatchError::Eof => "met unexpected EOF while reading output",
+            MatchError::Timeout => "timeout while trying to find matches output",
         }
     }
 
@@ -158,51 +146,22 @@ pub struct Handle {
     input_requests_tx: mpsc::UnboundedSender<InputRequest>,
 }
 
-struct LineCodec;
-
-impl codec::Decoder for LineCodec {
-    type Item = String;
-    type Error = io::Error;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<String>, io::Error> {
-        if let Some(n) = buf.as_ref().iter().position(|b| *b == b'\n') {
-            let line = buf.split_to(n);
-            buf.split_to(1);
-            return match ::std::str::from_utf8(line.as_ref()) {
-                Ok(s) => Ok(Some(s.to_string())),
-                Err(_) => Err(io::Error::new(io::ErrorKind::Other, "invalid string")),
-            };
-        }
-        Ok(None)
-    }
-}
-
-pub struct Stderr(codec::FramedRead<ChildStderr, LineCodec>);
-
-impl Stderr {
-    fn new(stderr: ChildStderr) -> Self {
-        Stderr(codec::FramedRead::new(stderr, LineCodec {}))
-    }
-}
-
-impl Stream for Stderr {
-    type Item = String;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.0.poll()
-    }
-}
-
 impl Handle {
     pub fn send(&self, bytes: Vec<u8>) -> Box<Future<Item = (), Error = Canceled>> {
         let handle = self.clone();
         let (response_tx, response_rx) = oneshot::channel::<()>();
-        handle.input_requests_tx.unbounded_send(InputRequest(bytes, response_tx)).unwrap();
+        handle
+            .input_requests_tx
+            .unbounded_send(InputRequest(bytes, response_tx))
+            .unwrap();
         Box::new(response_rx)
     }
 
-    pub fn expect(&mut self, matches: Vec<Match>, timeout: Option<Duration>) -> Box<Future<Item = MatchOutcome, Error = ()>> {
+    pub fn expect(
+        &mut self,
+        matches: Vec<Match>,
+        timeout: Option<Duration>,
+    ) -> Box<Future<Item = MatchOutcome, Error = ()>> {
         let (response_tx, response_rx) = oneshot::channel::<MatchOutcome>();
         let request = MatchRequest {
             matches,
@@ -215,30 +174,24 @@ impl Handle {
     }
 }
 
-impl Session {
-    pub fn spawn(cmd: &mut Command, handle: TokioHandle) -> Result<Handle, ()> {
-        debug!("spawning new command {:?}", cmd);
-        let mut process = cmd
-            .stdout(Stdio::piped())
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("RUST_BACKTRACE", "1")
-            .spawn_async(&handle.clone())
-            .unwrap();
+// TODO:
+//
+// - Make stdin evented PollEvented?
+// - Configure stding with Termios so that it's non-blocking. For other options (echo, nowait,
+//   etc.) see pexpect.
+//
+// NOTE: the man page of termios says it is unspecified whether e O_NONBLOCK file status flag takes
+// precedence over the MIN and TIME settings.
 
+impl Session {
+    pub fn spawn(cmd: Command, handle: &TokioHandle) -> Result<Handle, ()> {
+        debug!("spawning new command {:?}", cmd);
         let (input_tx, input_rx) = mpsc::unbounded::<InputRequest>();
         let (match_tx, match_rx) = mpsc::unbounded::<MatchRequest>();
-
-        handle.clone().spawn(
-            Stderr::new(process.stderr().take().unwrap()).for_each(|msg| {
-                error!("spawned process stderr: {}", msg);
-                Ok(())
-            }).map_err(|_| ()));
-
+        let mut pty = Pty::new::<::std::fs::File>(None, handle).unwrap();
+        let mut _child = pty.spawn(cmd).unwrap();
         let session = Session {
-            stdout: process.stdout().take().unwrap(),
-            stdin: process.stdin().take().unwrap(),
-            process: process,
+            pty: pty,
             handle: handle.clone(),
             buffer: Vec::new(),
             input_requests_rx: input_rx,
@@ -247,35 +200,36 @@ impl Session {
             match_requests: VecDeque::new(),
         };
         handle.spawn(session);
-
         Ok(Handle {
-            match_requests_tx: match_tx,
-            input_requests_tx: input_tx,
+            match_requests_tx: match_tx.clone(),
+            input_requests_tx: input_tx.clone(),
         })
     }
 
-    fn poll_pending_input(req: &mut ActiveInputRequest, stdin: &mut ChildStdin) -> Poll<(), io::Error> {
+    fn poll_pending_input<W: Write>(req: &mut InputRequest, input: &mut W) -> Poll<(), io::Error> {
         debug!("processing pending input request");
+        let mut size = 0;
         loop {
-            match stdin.write_buf(&mut req.0) {
-                Ok(Async::Ready(_)) => {
-                    if !req.0.has_remaining() {
+            match input.write(&req.0[size..]) {
+                Ok(i) => {
+                    size += i;
+                    if size == req.0.len() {
                         return Ok(Async::Ready(()));
                     }
                     // FIXME: do we need to check if we wrote 0 bytes to avoid infinite looping?
                     continue;
                 }
-                // Cannot happen according to the docs https://docs.rs/tokio-io/0.1.4/tokio_io/trait.AsyncWrite.html
-                Ok(Async::NotReady) => unreachable!(),
                 Err(e) => {
                     if e.kind() == io::ErrorKind::WouldBlock {
-                        return Ok(Async::NotReady);
+                        break;
                     } else {
                         return Err(e);
                     }
                 }
             }
         }
+        req.0 = req.0.split_off(size);
+        Ok(Async::NotReady)
     }
 
     fn poll_pending_match(
@@ -286,7 +240,10 @@ impl Session {
         debug!("checking pending match request: {:?}", req);
 
         if let Some((match_index, match_start, match_end)) = Self::try_match(req, buffer) {
-            debug!("found match (mach index {}, match range: [{}, {}]", match_index, match_start, match_end);
+            debug!(
+                "found match (mach index {}, match range: [{}, {}]",
+                match_index, match_start, match_end
+            );
             let match_buf = Self::extract_match(buffer, match_start, match_end);
             return Ok(Async::Ready(Ok((match_index, match_buf))));
         }
@@ -331,17 +288,15 @@ impl Session {
         Ok(Async::NotReady)
     }
 
-    fn read_stdout(&mut self) -> Result<usize, io::Error> {
-        debug!("reading from stdout");
+    fn read_output(&mut self) -> Result<usize, io::Error> {
+        debug!("reading from pty");
         let mut buf = [0; 4096];
         let mut size = 0;
         loop {
-            // read is supposed to be sync, but since ChildStdout implement AsyncRead, it's async.
-            // See the doc about that: https://docs.rs/tokio-io/0.1.2/tokio_io/trait.AsyncRead.html
-            match self.stdout.read(&mut buf[..]) {
+            match self.pty.read(&mut buf[..]) {
                 Ok(i) => {
                     if i == 0 {
-                        warn!("met EOF while reading stdout");
+                        warn!("met EOF while reading from pty");
                         return Err(io::ErrorKind::UnexpectedEof.into());
                     }
                     size += i;
@@ -350,7 +305,7 @@ impl Session {
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::WouldBlock {
-                        debug!("done reading from stdout");
+                        debug!("done reading from pty");
                         debug!("buffer so far: {}", String::from_utf8_lossy(&self.buffer));
                         return Ok(size);
                     }
@@ -389,7 +344,7 @@ impl Session {
         loop {
             match self.input_requests_rx.poll() {
                 Ok(Async::Ready(Some(req))) => {
-                    self.input_requests.push_back(req.into());
+                    self.input_requests.push_back(req);
                     debug!("got input request");
                 }
                 Ok(Async::Ready(None)) => {
@@ -428,21 +383,24 @@ impl Session {
     }
 
     fn extract_match(buffer: &mut Vec<u8>, start: usize, end: usize) -> Vec<u8> {
+        let new_buf = buffer.split_off(end);
         let matched = buffer.split_off(start);
-        let _ = buffer.split_off(end - start);
-        matched
+        // buffer now contains what we want to return
+        let ret = buffer.clone();
+        *buffer = new_buf;
+        ret
     }
 
     fn process_input(&mut self) {
         debug!("processing input requests");
         let Session {
             ref mut input_requests,
-            ref mut stdin,
+            ref mut pty,
             ..
         } = *self;
         let mut n_requests_processed = 0;
         while let Some(req) = input_requests.get_mut(n_requests_processed) {
-            match Self::poll_pending_input(req, stdin) {
+            match Self::poll_pending_input(req, pty) {
                 Ok(Async::Ready(())) => {
                     debug!("processed input request");
                     n_requests_processed += 1;
@@ -459,13 +417,13 @@ impl Session {
 
     fn process_matches(&mut self) -> Result<(), io::Error> {
         let mut eof = false;
-        match self.read_stdout() {
+        match self.read_output() {
             Ok(i) => {
-                debug!("read {} bytes from stdout", i);
+                debug!("read {} bytes from pty", i);
             }
             Err(e) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
-                    debug!("EOF in stdout");
+                    debug!("EOF in pty");
                     eof = true;
                 } else {
                     return Err(e);
@@ -505,9 +463,6 @@ impl Future for Session {
         self.get_match_requests().unwrap();
         self.process_input();
         self.process_matches().unwrap();
-
-
-
         Ok(Async::NotReady)
     }
 }

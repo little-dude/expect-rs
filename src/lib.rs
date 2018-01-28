@@ -22,8 +22,7 @@ use futures::sync::{mpsc, oneshot};
 
 use regex::Regex;
 
-use tokio_core::reactor::Handle;
-use tokio_core::reactor::Timeout;
+use tokio_core::reactor::{Core, Handle, Timeout};
 
 mod pty;
 use pty::*;
@@ -209,12 +208,51 @@ impl Drop for Client {
     }
 }
 
+#[derive(Debug)]
+pub enum InitError {
+    Reactor(io::Error),
+    Pty(io::Error),
+    Spawn(io::Error),
+}
+
+impl Error for InitError {
+    fn description(&self) -> &str {
+        use InitError::*;
+        match *self {
+            Reactor(_) => "failed to start the event loop",
+            Pty(_) => "failed to spawn a pty",
+            Spawn(_) => "failed to spawn the command",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        use InitError::*;
+        match *self {
+            Reactor(ref e) => Some(e),
+            Pty(ref e) => Some(e),
+            Spawn(ref e) => Some(e),
+        }
+    }
+}
+
+impl fmt::Display for InitError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        if let Some(cause) = self.cause() {
+            write!(f, "{}: {}", self.description(), cause)
+        } else {
+            f.write_str(self.description())
+        }
+    }
+}
+
 impl Session {
-    pub fn spawn(cmd: Command) -> Result<Client, ()> {
+    pub fn spawn(cmd: Command) -> Result<Client, InitError> {
         debug!("spawning new command {:?}", cmd);
         let (input_tx, input_rx) = mpsc::unbounded::<InputRequest>();
         let (match_tx, match_rx) = mpsc::unbounded::<MatchRequest>();
         let (drop_tx, drop_rx) = oneshot::channel::<()>();
+
+        let (err_tx, err_rx) = oneshot::channel::<Result<(), InitError>>();
 
         // spawn the core future in a separate thread.
         //
@@ -222,15 +260,42 @@ impl Session {
         // synchronous client, since calling `wait()` blocks the current thread, preventing the
         // event loop from making progress... But running the event loop in a separate thread, we
         // can call `wait()` in the client.
+        //
+        // FIXME: the error handling is pretty tedious here... not sure whether we can do anything
+        // about that since it all happens in a separate thread.
         let thread = thread::Builder::new()
             .name("expect-event-loop".into())
             .spawn(move || {
-                use tokio_core::reactor::Core;
-                let mut core = Core::new().unwrap();
+                let mut core = match Core::new() {
+                    Ok(core) => core,
+                    Err(e) => {
+                        // this cannot fail as long as the receiver has not been dropped
+                        err_tx.send(Err(InitError::Reactor(e))).unwrap();
+                        return;
+                    }
+                };
 
-                let mut pty = Pty::new::<::std::fs::File>(None, &core.handle()).unwrap();
+                let mut pty = match Pty::new::<::std::fs::File>(None, &core.handle()) {
+                    Ok(pty) => pty,
+                    Err(e) => {
+                        // this cannot fail as long as the receiver has not been dropped
+                        err_tx.send(Err(InitError::Pty(e))).unwrap();
+                        return;
+                    }
+                };
+
                 // FIXME: I guess we should do something with the child?
-                let _child = pty.spawn(cmd).unwrap();
+                let _child = match pty.spawn(cmd) {
+                    Ok(child) => child,
+                    Err(e) => {
+                        // this cannot fail as long as the receiver has not been dropped
+                        err_tx.send(Err(InitError::Spawn(e))).unwrap();
+                        return;
+                    }
+                };
+
+                // this cannot fail as long as the receiver has not been dropped
+                err_tx.send(Ok(())).unwrap();
 
                 let session = Session {
                     pty: pty,
@@ -242,9 +307,14 @@ impl Session {
                     match_requests: VecDeque::new(),
                     drop_rx: drop_rx,
                 };
+
                 core.run(session).unwrap();
             })
             .unwrap();
+
+        // wait() cannot fail on the receiver
+        err_rx.wait().unwrap()?;
+
         Ok(Client {
             match_requests_tx: match_tx.clone(),
             input_requests_tx: input_tx.clone(),

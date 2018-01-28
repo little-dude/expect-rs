@@ -55,33 +55,9 @@ impl PartialEq for Match {
     }
 }
 
+#[derive(Debug)]
 struct InputRequest(Vec<u8>, oneshot::Sender<()>);
 
-pub struct Session {
-    /// A tokio core handle used to spawn asynchronous tasks.
-    handle: Handle,
-
-    /// process stdout async reader
-    pty: Pty,
-
-    /// buffer where we store bytes read from stdout
-    buffer: Vec<u8>,
-
-    /// Receiver for the input requests coming from the expect handle.
-    input_requests_rx: mpsc::UnboundedReceiver<InputRequest>,
-    /// FIFO storage for the input requests. Requests are processed one after another, not
-    /// concurrently.
-    input_requests: VecDeque<InputRequest>,
-
-    /// Receiver for the matching requests coming from the expect handle.
-    match_requests_rx: mpsc::UnboundedReceiver<MatchRequest>,
-
-    /// FIFO storage for the matching requests. Requests are processed one after another, not
-    /// concurrently.
-    match_requests: VecDeque<ActiveMatchRequest>,
-
-    drop_rx: oneshot::Receiver<()>,
-}
 
 #[derive(Debug)]
 struct MatchRequest {
@@ -93,11 +69,13 @@ struct MatchRequest {
     timeout: Option<Duration>,
 }
 
+
+
 impl MatchRequest {
     /// Start the timeout future for the match request, effectively "activating" the match request.
-    fn activate(self, handle: &Handle) -> Result<ActiveMatchRequest, io::Error> {
+    fn activate(self, handle: &Handle) -> Result<ActiveMatchRequest, InternalError> {
         let timeout = if let Some(duration) = self.timeout {
-            Some(Timeout::new(duration, handle)?)
+            Some(Timeout::new(duration, handle).map_err(|e| InternalError::SpawnTimeout(e))?)
         } else {
             None
         };
@@ -150,54 +128,156 @@ impl fmt::Display for ExpectError {
 
 type MatchOutcome = Result<(usize, Vec<u8>), ExpectError>;
 
+#[derive(Debug)]
 pub struct Client {
+    /// Channel to send match requests to the expect session
     match_requests_tx: mpsc::UnboundedSender<MatchRequest>,
+    /// Channel to send input requests to the expect session
     input_requests_tx: mpsc::UnboundedSender<InputRequest>,
+    /// Handle to the thread where the expect session is running
     thread: Option<thread::JoinHandle<()>>,
-    drop_tx: Option<oneshot::Sender<()>>,
+    /// Channel to send a shutdown signal to the expect session
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    ///
+    shutdown_err_rx: Option<oneshot::Receiver<InternalError>>,
 }
 
 impl Client {
-    pub fn send(&self, bytes: Vec<u8>) -> () {
-        let handle = self.clone();
-        let (response_tx, response_rx) = oneshot::channel::<()>();
-        // Sending fails if the receiver has been dropped which should not happen as long as there
-        // is a client. So it is safe to unwrap.
-        handle
-            .input_requests_tx
-            .unbounded_send(InputRequest(bytes, response_tx))
-            .unwrap();
-        // There is no documentation suggesting receiving can fail so we assume it cannot.
-        response_rx.wait().unwrap();
+    pub fn spawn(cmd: Command) -> Result<Client, InitError> {
+        debug!("spawning new command {:?}", cmd);
+        let (input_tx, input_rx) = mpsc::unbounded::<InputRequest>();
+        let (match_tx, match_rx) = mpsc::unbounded::<MatchRequest>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let (init_err_tx, init_err_rx) = oneshot::channel::<Result<(), InitError>>();
+        let (shutdown_err_tx, shutdown_err_rx) = oneshot::channel::<InternalError>();
+
+        // spawn the core future in a separate thread.
+        //
+        // it's bad practice to spawn our own core but otherwise, it's complicated to provide a
+        // synchronous client, since calling `wait()` blocks the current thread, preventing the
+        // event loop from making progress... But running the event loop in a separate thread, we
+        // can call `wait()` in the client.
+        let thread = thread::Builder::new()
+            .name("expect-event-loop".into())
+            .spawn(move || {
+                let mut core = match Core::new() {
+                    Ok(core) => core,
+                    Err(e) => {
+                        // this cannot fail as long as the receiver has not been dropped
+                        init_err_tx.send(Err(InitError::Reactor(e))).unwrap();
+                        return;
+                    }
+                };
+
+                let mut pty = match Pty::new::<::std::fs::File>(None, &core.handle()) {
+                    Ok(pty) => pty,
+                    Err(e) => {
+                        // this cannot fail as long as the receiver has not been dropped
+                        init_err_tx.send(Err(InitError::Pty(e))).unwrap();
+                        return;
+                    }
+                };
+
+                // FIXME: I guess we should do something with the child?
+                let _child = match pty.spawn(cmd) {
+                    Ok(child) => child,
+                    Err(e) => {
+                        // this cannot fail as long as the receiver has not been dropped
+                        init_err_tx.send(Err(InitError::SpawnCommand(e))).unwrap();
+                        return;
+                    }
+                };
+
+                // this cannot fail as long as the receiver has not been dropped
+                init_err_tx.send(Ok(())).unwrap();
+
+                let session = Session {
+                    pty: pty,
+                    handle: core.handle(),
+                    buffer: Vec::new(),
+                    input_requests_rx: input_rx,
+                    match_requests_rx: match_rx,
+                    input_requests: VecDeque::new(),
+                    match_requests: VecDeque::new(),
+                    shutdown_rx: shutdown_rx,
+                };
+
+                if let Err(e) = core.run(session) {
+                    error!("event loop terminated with an error: {}", e);
+                    // Assume the client has not yet been dropped, since given our Drop
+                    // implementation, client can only be dropped after it joined this thread.
+                    shutdown_err_tx.send(e).unwrap();
+                }
+            })
+            .map_err(|e| InitError::SpawnWorker(e))?;
+
+        // wait() cannot fail on the receiver
+        init_err_rx.wait().unwrap()?;
+
+        Ok(Client {
+            match_requests_tx: match_tx.clone(),
+            input_requests_tx: input_tx.clone(),
+            thread: Some(thread),
+            shutdown_tx: Some(shutdown_tx),
+            shutdown_err_rx: Some(shutdown_err_rx),
+        })
     }
 
-    pub fn expect(&mut self, matches: Vec<Match>, timeout: Option<Duration>) -> ExpectResult {
+    pub fn send(&mut self, bytes: Vec<u8>) -> Result<(), InternalError> {
+        let (response_tx, response_rx) = oneshot::channel::<()>();
+        match self.input_requests_tx.unbounded_send(InputRequest(bytes, response_tx)) {
+            Ok(()) => {
+                // There is no documentation suggesting receiving can fail so we assume it cannot.
+                Ok(response_rx.wait().unwrap())
+            }
+            Err(_) => {
+                // Sending fails if the receiver has been dropped which should not happen unless an
+                // error occured in the event loop.
+                Err(self.get_event_loop_err())
+            }
+        }
+    }
+
+    pub fn expect(&mut self, matches: Vec<Match>, timeout: Option<Duration>) -> Result<ExpectResult, InternalError> {
         let (response_tx, response_rx) = oneshot::channel::<MatchOutcome>();
-        let request = MatchRequest {
-            matches,
-            response_tx,
-            timeout,
-        };
+        let request = MatchRequest { matches, response_tx, timeout };
         // Sending fails if the receiver has been dropped which should not happen as long as there
         // is a client. So it is safe to unwrap.
-        self.match_requests_tx.unbounded_send(request).unwrap();
-        // There is no documentation suggesting receiving can fail so we assume it cannot.
-        response_rx.wait().unwrap()
+        match self.match_requests_tx.unbounded_send(request) {
+            Ok(()) => {
+                // There is no documentation suggesting receiving can fail so we assume it cannot.
+                Ok(response_rx.wait().unwrap())
+            }
+            Err(_) => {
+                // Sending fails if the receiver has been dropped which should not happen unless an
+                // error occured in the event loop.
+                Err(self.get_event_loop_err())
+            }
+        }
+    }
+
+    pub fn get_event_loop_err(&mut self) -> InternalError {
+        match self.shutdown_err_rx.take() {
+            // Unwrapping is fine because wait() cannot fail
+            Some(chan) => chan.wait().unwrap(),
+            // If there's no channel, it means the expect session already errored out and we
+            // already read the error from the channel so we just return this error.
+            None => InternalError::NoSession,
+        }
     }
 }
 
 type ExpectResult = Result<(usize, std::vec::Vec<u8>), ExpectError>;
 
-// FIXME: This Drop implementation assume we have only one client. Ultimately, we want Client to be
-// Clone-able.
 impl Drop for Client {
     fn drop(&mut self) {
-        // Safe to unwrap, since there's always a drop_tx field
+        // Safe to unwrap, since there's always a shutdown_tx field
         //
         // We also ignore the result of send(), because if it fails, it means the receiver has been
         // dropped already, and so that the Session has been dropped, which is precisely what we're
         // trying to achieve.
-        let _ = self.drop_tx.take().unwrap().send(());
+        let _ = self.shutdown_tx.take().unwrap().send(());
         // Safe to unwrap, since there's always a thread field
         //
         // Also, if join() fails, it means the child thread panicked, and the error contains the
@@ -212,7 +292,8 @@ impl Drop for Client {
 pub enum InitError {
     Reactor(io::Error),
     Pty(io::Error),
-    Spawn(io::Error),
+    SpawnCommand(io::Error),
+    SpawnWorker(io::Error),
 }
 
 impl Error for InitError {
@@ -221,7 +302,8 @@ impl Error for InitError {
         match *self {
             Reactor(_) => "failed to start the event loop",
             Pty(_) => "failed to spawn a pty",
-            Spawn(_) => "failed to spawn the command",
+            SpawnCommand(_) => "failed to spawn the command",
+            SpawnWorker(_) => "failed to spawn a background thread to run the event loop",
         }
     }
 
@@ -230,7 +312,8 @@ impl Error for InitError {
         match *self {
             Reactor(ref e) => Some(e),
             Pty(ref e) => Some(e),
-            Spawn(ref e) => Some(e),
+            SpawnCommand(ref e) => Some(e),
+            SpawnWorker(ref e) => Some(e),
         }
     }
 }
@@ -245,84 +328,34 @@ impl fmt::Display for InitError {
     }
 }
 
+struct Session {
+    /// A tokio core handle used to spawn asynchronous tasks.
+    handle: Handle,
+
+    /// process stdout async reader
+    pty: Pty,
+
+    /// buffer where we store bytes read from stdout
+    buffer: Vec<u8>,
+
+    /// Receiver for the input requests coming from the expect handle.
+    input_requests_rx: mpsc::UnboundedReceiver<InputRequest>,
+    /// FIFO storage for the input requests. Requests are processed one after another, not
+    /// concurrently.
+    input_requests: VecDeque<InputRequest>,
+
+    /// Receiver for the matching requests coming from the expect handle.
+    match_requests_rx: mpsc::UnboundedReceiver<MatchRequest>,
+
+    /// FIFO storage for the matching requests. Requests are processed one after another, not
+    /// concurrently.
+    match_requests: VecDeque<ActiveMatchRequest>,
+
+    /// Channel to receive shutdown signal from the client
+    shutdown_rx: oneshot::Receiver<()>,
+}
+
 impl Session {
-    pub fn spawn(cmd: Command) -> Result<Client, InitError> {
-        debug!("spawning new command {:?}", cmd);
-        let (input_tx, input_rx) = mpsc::unbounded::<InputRequest>();
-        let (match_tx, match_rx) = mpsc::unbounded::<MatchRequest>();
-        let (drop_tx, drop_rx) = oneshot::channel::<()>();
-
-        let (err_tx, err_rx) = oneshot::channel::<Result<(), InitError>>();
-
-        // spawn the core future in a separate thread.
-        //
-        // it's bad practice to spawn our own core but otherwise, it's complicated to provide a
-        // synchronous client, since calling `wait()` blocks the current thread, preventing the
-        // event loop from making progress... But running the event loop in a separate thread, we
-        // can call `wait()` in the client.
-        //
-        // FIXME: the error handling is pretty tedious here... not sure whether we can do anything
-        // about that since it all happens in a separate thread.
-        let thread = thread::Builder::new()
-            .name("expect-event-loop".into())
-            .spawn(move || {
-                let mut core = match Core::new() {
-                    Ok(core) => core,
-                    Err(e) => {
-                        // this cannot fail as long as the receiver has not been dropped
-                        err_tx.send(Err(InitError::Reactor(e))).unwrap();
-                        return;
-                    }
-                };
-
-                let mut pty = match Pty::new::<::std::fs::File>(None, &core.handle()) {
-                    Ok(pty) => pty,
-                    Err(e) => {
-                        // this cannot fail as long as the receiver has not been dropped
-                        err_tx.send(Err(InitError::Pty(e))).unwrap();
-                        return;
-                    }
-                };
-
-                // FIXME: I guess we should do something with the child?
-                let _child = match pty.spawn(cmd) {
-                    Ok(child) => child,
-                    Err(e) => {
-                        // this cannot fail as long as the receiver has not been dropped
-                        err_tx.send(Err(InitError::Spawn(e))).unwrap();
-                        return;
-                    }
-                };
-
-                // this cannot fail as long as the receiver has not been dropped
-                err_tx.send(Ok(())).unwrap();
-
-                let session = Session {
-                    pty: pty,
-                    handle: core.handle(),
-                    buffer: Vec::new(),
-                    input_requests_rx: input_rx,
-                    match_requests_rx: match_rx,
-                    input_requests: VecDeque::new(),
-                    match_requests: VecDeque::new(),
-                    drop_rx: drop_rx,
-                };
-
-                core.run(session).unwrap();
-            })
-            .unwrap();
-
-        // wait() cannot fail on the receiver
-        err_rx.wait().unwrap()?;
-
-        Ok(Client {
-            match_requests_tx: match_tx.clone(),
-            input_requests_tx: input_tx.clone(),
-            thread: Some(thread),
-            drop_tx: Some(drop_tx),
-        })
-    }
-
     fn poll_pending_input<W: Write>(req: &mut InputRequest, input: &mut W) -> Poll<(), io::Error> {
         debug!("processing pending input request");
         let mut size = 0;
@@ -369,7 +402,7 @@ impl Session {
             // Maybe we were expecting EOF.
             if let Some(i) = req.matches.iter().position(|m| *m == Match::Eof) {
                 debug!("found EOF match (mach index {})", i);
-                return Ok(Async::Ready(Ok((i, buffer.clone()))));
+                return Ok(Async::Ready(Ok((i, buffer.drain(..).collect()))));
             } else {
                 debug!("found unexpected EOF");
                 return Ok(Async::Ready(Err(ExpectError::Eof)));
@@ -382,7 +415,7 @@ impl Session {
                 Ok(Async::Ready(())) => {
                     if let Some(i) = req.matches.iter().position(|m| *m == Match::Timeout) {
                         debug!("found timeout match (match index {})", i);
-                        return Ok(Async::Ready(Ok((i, buffer.clone()))));
+                        return Ok(Async::Ready(Ok((i, buffer.drain(..).collect()))));
                     } else {
                         debug!("found unexpected timeout");
                         return Ok(Async::Ready(Err(ExpectError::Timeout)));
@@ -413,7 +446,7 @@ impl Session {
             match self.pty.read(&mut buf[..]) {
                 Ok(i) => {
                     if i == 0 {
-                        warn!("met EOF while reading from pty");
+                        warn!("EOF while reading from pty");
                         return Err(io::ErrorKind::UnexpectedEof.into());
                     }
                     size += i;
@@ -433,14 +466,12 @@ impl Session {
     }
 
     /// Read match requests coming from the ClientHandle.
-    fn get_match_requests(&mut self) -> Result<(), ()> {
+    fn get_match_requests(&mut self) -> Result<(), InternalError> {
         let tokio_handle = self.handle.clone();
         loop {
             match self.match_requests_rx.poll() {
                 Ok(Async::Ready(Some(req))) => {
-                    // FIXME: error handling
-                    self.match_requests
-                        .push_back(req.activate(&tokio_handle).unwrap())
+                    self.match_requests.push_back(req.activate(&tokio_handle)?);
                 }
                 // The channel is closed, which means the ClientHandle has been dropped. This
                 // should not happen because the ClientHandle waits for the Session future to
@@ -523,24 +554,28 @@ impl Session {
                 Err(e) => panic!("failed to process input request: {}", e),
             }
         }
+
+        assert!(input_requests.len() >= n_requests_processed);
         for _i in 0..n_requests_processed {
+            // safe to unwrap as shown by assert above
             let req = input_requests.pop_front().unwrap();
-            req.1.send(()).unwrap();
+            // FIXME: should we return an error instead?
+            if let Err(_) = req.1.send(()) {
+                error!("Cannot send input ack to client: the receiver was dropped already");
+            }
         }
     }
 
-    fn process_matches(&mut self) -> Result<(), io::Error> {
+    fn process_matches(&mut self) -> Result<(), InternalError> {
         let mut eof = false;
         match self.read_output() {
-            Ok(i) => {
-                debug!("read {} bytes from pty", i);
-            }
+            Ok(i) => debug!("read {} bytes from pty", i),
             Err(e) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
                     debug!("EOF in pty");
                     eof = true;
                 } else {
-                    return Err(e);
+                    return Err(InternalError::ReadOutput(e));
                 }
             }
         }
@@ -559,9 +594,15 @@ impl Session {
                 Err(e) => panic!("error while processing match request {:?}: {}", req, e),
             }
         }
+
+        assert!(results.len() <= match_requests.len());
         for res in results.drain(..) {
+            // unwrapping is safe as shown by previous assert!()
             let req = match_requests.pop_front().unwrap();
-            req.response_tx.send(res).unwrap();
+            // FIXME: should we return an error instead?
+            if let Err(_) = req.response_tx.send(res) {
+                error!("Cannot send match outcome to client: the receiver was dropped already");
+            }
         }
 
         Ok(())
@@ -570,22 +611,64 @@ impl Session {
 
 impl Future for Session {
     type Item = ();
-    type Error = ();
+    type Error = InternalError;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.get_input_requests();
-        if let Err(_e) = self.get_match_requests() {
-            return Err(());
+        if let Err(e) = self.get_match_requests() {
+            error!("Failed to process match requests from the client: {}", e);
+            return Err(e);
         }
+
         self.process_input();
-        if let Err(_e) = self.process_matches() {
-            return Err(());
+        if let Err(e) = self.process_matches() {
+            error!("Failed to process match requests from the client: {}", e);
+            return Err(e);
         }
-        match self.drop_rx.poll() {
+
+        match self.shutdown_rx.poll() {
             Ok(Async::Ready(())) => return Ok(Async::Ready(())),
             Ok(Async::NotReady) => {}
-            Err(Canceled) => return Err(()),
+            Err(Canceled) => panic!("Client dropped before the event loop finished"),
         }
         Ok(Async::NotReady)
+    }
+}
+
+/// Type used signal errors while the session is running
+#[derive(Debug)]
+pub enum InternalError {
+    SpawnTimeout(io::Error),
+    ReadOutput(io::Error),
+    NoSession,
+}
+
+impl Error for InternalError {
+    fn description(&self) -> &str {
+        use InternalError::*;
+        match *self {
+            SpawnTimeout(_) => "failed to start a match request timeout future",
+            ReadOutput(_) => "failed to read output from the pty",
+            NoSession => "the expect session already errored out",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        use InternalError::*;
+        match *self {
+            SpawnTimeout(ref e) => Some(e),
+            ReadOutput(ref e) => Some(e),
+            NoSession => None,
+        }
+    }
+}
+
+impl fmt::Display for InternalError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        if let Some(cause) = self.cause() {
+            write!(f, "{}: {}", self.description(), cause)
+        } else {
+            f.write_str(self.description())
+        }
     }
 }

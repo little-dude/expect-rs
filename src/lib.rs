@@ -58,6 +58,11 @@ impl PartialEq for Match {
 #[derive(Debug)]
 struct InputRequest(Vec<u8>, oneshot::Sender<()>);
 
+#[derive(Copy, Debug, Clone, Eq, PartialEq)]
+pub enum MatchMode {
+    Raw,
+    Line,
+}
 
 #[derive(Debug)]
 struct MatchRequest {
@@ -67,9 +72,8 @@ struct MatchRequest {
     response_tx: oneshot::Sender<MatchOutcome>,
     /// Optional timeout for a match to be found.
     timeout: Option<Duration>,
+    mode: MatchMode,
 }
-
-
 
 impl MatchRequest {
     /// Start the timeout future for the match request, effectively "activating" the match request.
@@ -84,6 +88,7 @@ impl MatchRequest {
             matches: self.matches,
             response_tx: self.response_tx,
             timeout: timeout,
+            mode: self.mode,
         })
     }
 }
@@ -97,6 +102,7 @@ struct ActiveMatchRequest {
     response_tx: oneshot::Sender<MatchOutcome>,
     /// Optional timeout for a match to be found.
     timeout: Option<Timeout>,
+    mode: MatchMode,
 }
 
 #[derive(Debug, Clone, Hash)]
@@ -226,7 +232,9 @@ impl Client {
 
     pub fn send(&mut self, bytes: Vec<u8>) -> Result<(), InternalError> {
         let (response_tx, response_rx) = oneshot::channel::<()>();
-        match self.input_requests_tx.unbounded_send(InputRequest(bytes, response_tx)) {
+        match self.input_requests_tx
+            .unbounded_send(InputRequest(bytes, response_tx))
+        {
             Ok(()) => {
                 // There is no documentation suggesting receiving can fail so we assume it cannot.
                 Ok(response_rx.wait().unwrap())
@@ -239,9 +247,19 @@ impl Client {
         }
     }
 
-    pub fn expect(&mut self, matches: Vec<Match>, timeout: Option<Duration>) -> Result<ExpectResult, InternalError> {
+    pub fn expect(
+        &mut self,
+        matches: Vec<Match>,
+        timeout: Option<Duration>,
+        mode: MatchMode,
+    ) -> Result<ExpectResult, InternalError> {
         let (response_tx, response_rx) = oneshot::channel::<MatchOutcome>();
-        let request = MatchRequest { matches, response_tx, timeout };
+        let request = MatchRequest {
+            matches,
+            response_tx,
+            timeout,
+            mode,
+        };
         // Sending fails if the receiver has been dropped which should not happen as long as there
         // is a client. So it is safe to unwrap.
         match self.match_requests_tx.unbounded_send(request) {
@@ -455,8 +473,7 @@ impl Session {
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::WouldBlock {
-                        debug!("done reading from pty");
-                        debug!("buffer so far: {}", String::from_utf8_lossy(&self.buffer));
+                        debug!("finished reading {} bytes from pty", size);
                         return Ok(size);
                     }
                     return Err(e);
@@ -506,6 +523,13 @@ impl Session {
     }
 
     fn try_match(req: &mut ActiveMatchRequest, buffer: &[u8]) -> Option<(usize, usize, usize)> {
+        match req.mode {
+            MatchMode::Line => Self::try_match_lines(req, buffer),
+            MatchMode::Raw => Self::try_match_raw(req, buffer),
+        }
+    }
+
+    fn try_match_raw(req: &mut ActiveMatchRequest, buffer: &[u8]) -> Option<(usize, usize, usize)> {
         let string = String::from_utf8_lossy(buffer);
         for (i, m) in req.matches.iter().enumerate() {
             debug!("trying to find match for {:?} (index {})", m, i);
@@ -522,6 +546,37 @@ impl Session {
                 }
                 Match::Bytes(ref _bytes) => unimplemented!(),
                 Match::Eof | Match::Timeout => continue,
+            }
+        }
+        None
+    }
+
+    fn try_match_lines(
+        req: &mut ActiveMatchRequest,
+        buffer: &[u8],
+    ) -> Option<(usize, usize, usize)> {
+        info!("EWFEW");
+        let lines = get_lines(buffer, LineMode::Full);
+        info!("AAA");
+        for (i, m) in req.matches.iter().enumerate() {
+            let mut offset = 0;
+            debug!("trying to find match for {:?} (index {})", m, i);
+            for line in &lines {
+                match *m {
+                    Match::Regex(ref re) => {
+                        if let Some(position) = re.find(&line) {
+                            return Some((i, offset + position.start(), offset + position.end()));
+                        }
+                    }
+                    Match::Utf8(ref s) => {
+                        if let Some(start) = line.find(s) {
+                            return Some((i, offset + start, offset + start + s.len()));
+                        }
+                    }
+                    Match::Bytes(ref _bytes) => unimplemented!(),
+                    Match::Eof | Match::Timeout => {}
+                }
+                offset += line.as_bytes().len()
             }
         }
         None
@@ -671,4 +726,35 @@ impl fmt::Display for InternalError {
             f.write_str(self.description())
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LineMode {
+    Full,
+    Trimmed,
+}
+
+fn get_lines(buf: &[u8], mode: LineMode) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut prev_idx = 0;
+    let mut new_idx;
+    while prev_idx < buf.len() {
+        if let Some(offset) = buf[prev_idx..].iter().position(|b| *b == b'\n') {
+            new_idx = prev_idx + offset;
+            if mode == LineMode::Trimmed {
+                lines.push(String::from_utf8_lossy(&buf[prev_idx..new_idx + 1]).into_owned());
+            }
+            if buf.len() < new_idx + 1 && buf[new_idx + 1] == b'\r' {
+                new_idx += 1;
+            }
+            if mode == LineMode::Full {
+                lines.push(String::from_utf8_lossy(&buf[prev_idx..new_idx + 1]).into_owned());
+            }
+            prev_idx = new_idx + 1;
+        } else {
+            lines.push(String::from_utf8_lossy(&buf[prev_idx..]).into_owned());
+            break;
+        }
+    }
+    return lines;
 }

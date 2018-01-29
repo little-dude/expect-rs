@@ -185,8 +185,9 @@ impl Client {
                     }
                 };
 
-                // FIXME: I guess we should do something with the child?
-                let _child = match pty.spawn(cmd) {
+                // FIXME: keep the child around, we'll need to call waitpid other it'll become a
+                // zombie.
+                let child = match pty.spawn(cmd) {
                     Ok(child) => child,
                     Err(e) => {
                         // this cannot fail as long as the receiver has not been dropped

@@ -551,9 +551,7 @@ impl EventLoop {
         req: &mut ActiveMatchRequest,
         buffer: &[u8],
     ) -> Option<(usize, usize, usize)> {
-        info!("EWFEW");
         let lines = get_lines(buffer, LineMode::Full);
-        info!("AAA");
         for (i, m) in req.matches.iter().enumerate() {
             let mut offset = 0;
             debug!("trying to find match for {:?} (index {})", m, i);

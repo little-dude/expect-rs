@@ -139,7 +139,7 @@ impl Client {
         let (match_tx, match_rx) = mpsc::unbounded::<MatchRequest>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        let (init_err_tx, init_err_rx) = oneshot::channel::<Result<(), InitError>>();
+        let (init_res_tx, init_res_rx) = oneshot::channel::<Result<(), InitError>>();
         let (shutdown_err_tx, shutdown_err_rx) = oneshot::channel::<InternalError>();
 
         // spawn the core future in a separate thread.
@@ -149,13 +149,13 @@ impl Client {
         // event loop from making progress... But running the event loop in a separate thread, we
         // can call `wait()` in the client.
         let thread = thread::Builder::new()
-            .name("expect-event-loop".into())
+            .name("expect-worker".into())
             .spawn(move || {
                 let mut core = match Core::new() {
                     Ok(core) => core,
                     Err(e) => {
                         // this cannot fail as long as the receiver has not been dropped
-                        init_err_tx.send(Err(InitError::Reactor(e))).unwrap();
+                        init_res_tx.send(Err(InitError::Reactor(e))).unwrap();
                         return;
                     }
                 };
@@ -164,7 +164,7 @@ impl Client {
                     Ok(pty) => pty,
                     Err(e) => {
                         // this cannot fail as long as the receiver has not been dropped
-                        init_err_tx.send(Err(InitError::Pty(e))).unwrap();
+                        init_res_tx.send(Err(InitError::Pty(e))).unwrap();
                         return;
                     }
                 };
@@ -175,13 +175,13 @@ impl Client {
                     Ok(child) => child,
                     Err(e) => {
                         // this cannot fail as long as the receiver has not been dropped
-                        init_err_tx.send(Err(InitError::SpawnCommand(e))).unwrap();
+                        init_res_tx.send(Err(InitError::SpawnCommand(e))).unwrap();
                         return;
                     }
                 };
 
                 // this cannot fail as long as the receiver has not been dropped
-                init_err_tx.send(Ok(())).unwrap();
+                init_res_tx.send(Ok(())).unwrap();
 
                 let session = EventLoop {
                     pty: pty,
@@ -195,7 +195,7 @@ impl Client {
                 };
 
                 if let Err(e) = core.run(session) {
-                    error!("event loop terminated with an error: {}", e);
+                    error!("expect worker terminated with an error: {}", e);
                     // Assume the client has not yet been dropped, since given our Drop
                     // implementation, client can only be dropped after it joined this thread.
                     shutdown_err_tx.send(e).unwrap();
@@ -203,8 +203,10 @@ impl Client {
             })
             .map_err(|e| InitError::SpawnWorker(e))?;
 
-        // wait() cannot fail on the receiver
-        init_err_rx.wait().unwrap()?;
+        // This should not happen. I see no reason why the receiver would get Err(Cancel) here.
+        init_res_rx
+            .wait()
+            .expect("failed to retrieve the init outcome");
 
         Ok(Client {
             match_requests_tx: match_tx.clone(),
@@ -220,14 +222,17 @@ impl Client {
         match self.input_requests_tx
             .unbounded_send(InputRequest(bytes, response_tx))
         {
-            Ok(()) => {
-                // There is no documentation suggesting receiving can fail so we assume it cannot.
-                Ok(response_rx.wait().unwrap())
-            }
+            Ok(()) => response_rx.wait().or_else(|_| {
+                error!("failed to receive response from the expect worker");
+                // The sender has been dropped, meaning the worker failed, so we try to retrieve
+                // the error, and if we can't find one we just return a generic ChanError.
+                Err(self.get_worker_err().unwrap_or(InternalError::ChanError))
+            }),
             Err(_) => {
-                // Sending fails if the receiver has been dropped which should not happen unless an
-                // error occured in the event loop.
-                Err(self.get_event_loop_err())
+                error!("failed to send input request to the expect worker");
+                // The sender has been dropped, meaning the worker failed, so we try to retrieve
+                // the error, and if we can't find one we just return a generic ChanError.
+                Err(self.get_worker_err().unwrap_or(InternalError::ChanError))
             }
         }
     }
@@ -245,28 +250,26 @@ impl Client {
             timeout,
             mode,
         };
-        // Sending fails if the receiver has been dropped which should not happen as long as there
-        // is a client. So it is safe to unwrap.
         match self.match_requests_tx.unbounded_send(request) {
-            Ok(()) => {
-                // There is no documentation suggesting receiving can fail so we assume it cannot.
-                Ok(response_rx.wait().unwrap())
-            }
+            Ok(()) => response_rx.wait().or_else(|_| {
+                error!("failed to receive response from the expect worker");
+                // The sender has been dropped, meaning the worker failed, so we try to retrieve
+                // the error, and if we can't find one we just return a generic ChanError.
+                Err(self.get_worker_err().unwrap_or(InternalError::ChanError))
+            }),
             Err(_) => {
-                // Sending fails if the receiver has been dropped which should not happen unless an
-                // error occured in the event loop.
-                Err(self.get_event_loop_err())
+                error!("failed to send match request to the expect worker");
+                // The sender has been dropped, meaning the worker failed, so we try to retrieve
+                // the error, and if we can't find one we just return a generic ChanError.
+                Err(self.get_worker_err().unwrap_or(InternalError::ChanError))
             }
         }
     }
 
-    pub fn get_event_loop_err(&mut self) -> InternalError {
-        match self.shutdown_err_rx.take() {
-            // Unwrapping is fine because wait() cannot fail
-            Some(chan) => chan.wait().unwrap(),
-            // If there's no channel, it means the expect session already errored out and we
-            // already read the error from the channel so we just return this error.
-            None => InternalError::NoEventLoop,
+    pub fn get_worker_err(&mut self) -> Option<InternalError> {
+        match self.shutdown_err_rx {
+            Some(ref mut chan) => chan.wait().ok(), // XXX: this will hang if there's no error
+            None => None,
         }
     }
 }
@@ -305,9 +308,7 @@ impl Error for InitError {
             InitError::Reactor(_) => "failed to start the event loop",
             InitError::Pty(_) => "failed to spawn a pty",
             InitError::SpawnCommand(_) => "failed to spawn the command",
-            InitError::SpawnWorker(_) => {
-                "failed to spawn a background thread to run the event loop"
-            }
+            InitError::SpawnWorker(_) => "failed to spawn an expect thread",
         }
     }
 
@@ -674,7 +675,7 @@ impl Future for EventLoop {
         match self.shutdown_rx.poll() {
             Ok(Async::Ready(())) => return Ok(Async::Ready(())),
             Ok(Async::NotReady) => {}
-            Err(Canceled) => panic!("Client dropped before the event loop finished"),
+            Err(Canceled) => panic!("Client dropped before the expect worker finished"),
         }
         Ok(Async::NotReady)
     }
@@ -686,6 +687,7 @@ pub enum InternalError {
     SpawnTimeout(io::Error),
     ReadOutput(io::Error),
     NoEventLoop,
+    ChanError,
 }
 
 impl Error for InternalError {
@@ -694,6 +696,9 @@ impl Error for InternalError {
             InternalError::SpawnTimeout(_) => "failed to start a match request timeout future",
             InternalError::ReadOutput(_) => "failed to read output from the pty",
             InternalError::NoEventLoop => "the expect session already errored out",
+            InternalError::ChanError => {
+                "failed to send or receive data via a channel, probably because one end got dropped"
+            }
         }
     }
 
@@ -702,6 +707,7 @@ impl Error for InternalError {
             InternalError::SpawnTimeout(ref e) => Some(e),
             InternalError::ReadOutput(ref e) => Some(e),
             InternalError::NoEventLoop => None,
+            InternalError::ChanError => None,
         }
     }
 }

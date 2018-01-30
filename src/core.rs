@@ -448,8 +448,19 @@ impl EventLoop {
         loop {
             match self.pty.read(&mut buf[..]) {
                 Ok(i) => {
+                    // FIXME: the rust doc say i == 0 *can* mean EOF[0]. This is quite vague, and
+                    // `man 2 read` does not help much on linux:
+                    //
+                    // >  If the file offset is at or past the end of file, no bytes are read, and
+                    // > read() returns zero.
+                    //
+                    // Also, what about other platforms?
+                    //
+                    // For now, just consider this EOF to avoid looping infinitely
+                    //
+                    // [0] doc.rust-lang.org/std/io/trait.Read.html/
                     if i == 0 {
-                        warn!("EOF while reading from pty");
+                        warn!("0 bytes read from pty");
                         return Err(io::ErrorKind::UnexpectedEof.into());
                     }
                     size += i;
@@ -611,12 +622,8 @@ impl EventLoop {
         match self.read_output() {
             Ok(i) => debug!("read {} bytes from pty", i),
             Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    debug!("EOF in pty");
-                    eof = true;
-                } else {
-                    return Err(InternalError::ReadOutput(e));
-                }
+                // FIXME: not sure if all the errors should be considered EOF.
+                eof = true;
             }
         }
 

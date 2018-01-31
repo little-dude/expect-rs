@@ -3,14 +3,14 @@ extern crate expect;
 extern crate futures;
 extern crate tokio_core;
 
-use std::time::Duration;
+use expect::{Client, Expect};
 use std::process::Command;
-use expect::Client;
+use std::time::Duration;
 
 fn main() {
     env_logger::init();
-    let cmd = Command::new("sh");
-    let mut client = Client::spawn(cmd).unwrap();
+    let mut expect = Expect::new().unwrap();
+    let mut client = expect.spawn(Command::new("sh")).unwrap();
     client.match_string("$".into()).unwrap();
     client.send_line("whoami".into()).unwrap();
     client.match_string("$".into()).unwrap();

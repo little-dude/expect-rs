@@ -77,7 +77,9 @@ impl Client {
     }
 
     pub fn send(&mut self, string: String) -> Result<(), SendError> {
-        self.inner.send(string.as_bytes().to_vec()).map_err(|e| SendError(e))
+        self.inner
+            .send(string.as_bytes().to_vec())
+            .map_err(|e| SendError(e))
     }
 
     pub fn send_line(&mut self, string: String) -> Result<(), SendError> {
@@ -108,7 +110,8 @@ impl Client {
 
     pub fn match_regex(&mut self, re: Regex) -> Result<String, ExpectError> {
         let match_req = vec![core::Match::Regex(re)];
-        let mut res = self.inner.expect(match_req, self.timeout.clone(), self.mode)??;
+        let mut res = self.inner
+            .expect(match_req, self.timeout.clone(), self.mode)??;
         assert_eq!(res.0, 0);
         Ok(String::from_utf8_lossy(res.1.as_mut()).into_owned())
     }
@@ -121,16 +124,17 @@ impl Client {
     }
 
     pub fn match_eof(&mut self) -> Result<String, ExpectError> {
-        let mut res = self.inner.expect(vec![core::Match::Eof], self.timeout.clone(), self.mode)??;
+        let mut res = self.inner
+            .expect(vec![core::Match::Eof], self.timeout.clone(), self.mode)??;
         assert_eq!(res.0, 0);
         Ok(String::from_utf8_lossy(res.1.as_mut()).into_owned())
     }
 
     pub fn expect(&mut self, matches: Vec<Match>) -> Result<(usize, String), ExpectError> {
-        let mut res = self.inner.expect(matches, self.timeout.clone(), self.mode)??;
+        let mut res = self.inner
+            .expect(matches, self.timeout.clone(), self.mode)??;
         Ok((res.0, String::from_utf8_lossy(res.1.as_mut()).into_owned()))
     }
-
 }
 
 #[derive(Debug)]
@@ -182,7 +186,7 @@ impl Error for ExpectError {
         match *self {
             ExpectError::Exited(_) => "the expect session finished",
             ExpectError::Eof => "EOF while reading process output",
-            ExpectError::Timeout => "time out while trying to find a match"
+            ExpectError::Timeout => "time out while trying to find a match",
         }
     }
 

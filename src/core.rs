@@ -198,8 +198,9 @@ impl Client {
                     error!("expect worker terminated with an error: {}", e);
                     // The client should not have been dropped yet, since given our Drop
                     // implementation, client can only be dropped after it joined this thread.
-                    expect_worker_err_tx.send(e)
-                                   .expect("expect worker: failed to send error to main thread");
+                    expect_worker_err_tx
+                        .send(e)
+                        .expect("expect worker: failed to send error to main thread");
                 }
             })
             .map_err(|e| InitError::SpawnWorker(e))?;

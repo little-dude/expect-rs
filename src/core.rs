@@ -269,7 +269,10 @@ impl Client {
 
     pub fn get_worker_err(&mut self) -> Option<InternalError> {
         match self.expect_worker_err_rx {
-            Some(ref mut chan) => chan.wait().ok(), // XXX: this will hang if there's no error
+            Some(ref mut chan) => match chan.poll() {
+                Ok(Async::Ready(e)) => Some(e),
+                _ => None,
+            },
             None => None,
         }
     }

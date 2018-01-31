@@ -129,7 +129,7 @@ pub struct Client {
     /// Channel to send a shutdown signal to the expect session
     shutdown_tx: Option<oneshot::Sender<()>>,
     ///
-    shutdown_err_rx: Option<oneshot::Receiver<InternalError>>,
+    expect_worker_err_rx: Option<oneshot::Receiver<InternalError>>,
 }
 
 impl Client {
@@ -140,7 +140,7 @@ impl Client {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let (init_res_tx, init_res_rx) = oneshot::channel::<Result<(), InitError>>();
-        let (shutdown_err_tx, shutdown_err_rx) = oneshot::channel::<InternalError>();
+        let (expect_worker_err_tx, expect_worker_err_rx) = oneshot::channel::<InternalError>();
 
         // spawn the core future in a separate thread.
         //
@@ -196,9 +196,10 @@ impl Client {
 
                 if let Err(e) = core.run(session) {
                     error!("expect worker terminated with an error: {}", e);
-                    // Assume the client has not yet been dropped, since given our Drop
+                    // The client should not have been dropped yet, since given our Drop
                     // implementation, client can only be dropped after it joined this thread.
-                    shutdown_err_tx.send(e).unwrap();
+                    expect_worker_err_tx.send(e)
+                                   .expect("expect worker: failed to send error to main thread");
                 }
             })
             .map_err(|e| InitError::SpawnWorker(e))?;
@@ -213,7 +214,7 @@ impl Client {
             input_requests_tx: input_tx.clone(),
             thread: Some(thread),
             shutdown_tx: Some(shutdown_tx),
-            shutdown_err_rx: Some(shutdown_err_rx),
+            expect_worker_err_rx: Some(expect_worker_err_rx),
         })
     }
 
@@ -267,7 +268,7 @@ impl Client {
     }
 
     pub fn get_worker_err(&mut self) -> Option<InternalError> {
-        match self.shutdown_err_rx {
+        match self.expect_worker_err_rx {
             Some(ref mut chan) => chan.wait().ok(), // XXX: this will hang if there's no error
             None => None,
         }

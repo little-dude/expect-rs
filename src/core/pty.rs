@@ -1,16 +1,16 @@
-use tty::ffi::openpty;
 use libc;
 use std::io::{self, Read, Write};
+use tty::ffi::openpty;
 
+use std::fs::File;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::fs::File;
 use std::process::{Child, Command, Stdio};
 
-use mio::unix::{EventedFd, UnixReady};
 use mio::{self, PollOpt, Ready, Token};
 use mio::event::Evented;
+use mio::unix::{EventedFd, UnixReady};
 
 use tokio_core::reactor::{Handle, PollEvented};
 

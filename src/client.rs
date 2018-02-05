@@ -26,14 +26,14 @@ impl Client {
         self.inner.send(bytes)
     }
 
-    pub fn send(&mut self, string: String) -> Result<(), SendError> {
+    pub fn send(&mut self, string: &str) -> Result<(), SendError> {
         self.inner.send(string.as_bytes().to_vec())
     }
 
     pub fn send_line(&mut self, string: String) -> Result<(), SendError> {
         let mut string = string;
         string.push('\n');
-        self.send(string)
+        self.send(&string)
     }
 
     pub fn set_line_mode(&mut self) {
@@ -81,7 +81,7 @@ impl Client {
 
     fn get_request(&self) -> MatchRequest {
         MatchRequest::new()
-            .set_opt_timeout(self.timeout.clone())
+            .set_opt_timeout(self.timeout)
             .set_mode(self.mode)
     }
 }

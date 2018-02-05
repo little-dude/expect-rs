@@ -67,7 +67,7 @@ enum Timeout {
 impl Timeout {
     fn activate(&mut self, handle: &Handle) -> Result<(), io::Error> {
         let active_timeout = if let Timeout::Inactive(ref duration) = *self {
-            Timeout::Active(TokioTimeout::new(duration.clone(), handle)?)
+            Timeout::Active(TokioTimeout::new(*duration, handle)?)
         } else {
             return Ok(());
         };
@@ -143,7 +143,7 @@ impl MatchRequest {
             for line in &lines {
                 match *m {
                     Match::Regex(ref re) => {
-                        if let Some(position) = re.find(&line) {
+                        if let Some(position) = re.find(line) {
                             return Some((i, offset + position.start(), offset + position.end()));
                         }
                     }
@@ -184,7 +184,7 @@ impl MatchRequest {
     }
 
     pub fn send_outcome(self, outcome: MatchOutcome) {
-        if let Err(_) = self.response_tx.send(outcome) {
+        if self.response_tx.send(outcome).is_err() {
             // Ignore the error: if the receiver was dropped, it does not care about the outcome
             // anyway.
             error!("Cannot send match outcome to client: the receiver was dropped already");
@@ -249,9 +249,15 @@ impl MatchRequestBuilder {
     }
 }
 
+impl Default for MatchRequestBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub type MatchOutcome = Result<(usize, Vec<u8>), ExpectError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LineMode {
     Full,
     Trimmed,
@@ -279,7 +285,7 @@ fn get_lines(buf: &[u8], mode: LineMode) -> Vec<String> {
             break;
         }
     }
-    return lines;
+    lines
 }
 
 fn extract_match(buffer: &mut Vec<u8>, start: usize, end: usize) -> Vec<u8> {

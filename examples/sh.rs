@@ -3,7 +3,7 @@ extern crate expect;
 extern crate futures;
 extern crate tokio_core;
 
-use expect::{Client, Expect};
+use expect::Expect;
 use std::process::Command;
 use std::time::Duration;
 

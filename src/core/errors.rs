@@ -18,8 +18,7 @@ impl Error for InitError {
 
     fn cause(&self) -> Option<&Error> {
         match *self {
-            InitError::Reactor(ref e) => Some(e),
-            InitError::SpawnWorker(ref e) => Some(e),
+            InitError::Reactor(ref e) | InitError::SpawnWorker(ref e) => Some(e),
         }
     }
 }
@@ -115,8 +114,7 @@ impl Error for SpawnError {
 
     fn cause(&self) -> Option<&Error> {
         match *self {
-            SpawnError::Pty(ref e) => Some(e),
-            SpawnError::SpawnCommand(ref e) => Some(e),
+            SpawnError::Pty(ref e) | SpawnError::SpawnCommand(ref e) => Some(e),
             SpawnError::Internal => None,
         }
     }

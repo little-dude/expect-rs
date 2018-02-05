@@ -54,12 +54,9 @@ impl ExpectHandle {
                     .send(())
                     .expect("expect worker: failed to send error to main thread");
             })
-            .map_err(|e| InitError::SpawnWorker(e))?;
+            .map_err(InitError::SpawnWorker)?;
 
-        init_res_rx
-            .wait()
-            .unwrap()
-            .map_err(|e| InitError::Reactor(e))?;
+        init_res_rx.wait().unwrap().map_err(InitError::Reactor)?;
 
         Ok(ExpectHandle {
             spawn_tx,
@@ -130,7 +127,7 @@ impl EventLoop {
 
     fn spawn(&mut self, request: SpawnRequest) {
         let (cmd, client_tx) = request;
-        if let Err(_) = client_tx.send(Session::spawn(cmd, self.handle.clone())) {
+        if client_tx.send(Session::spawn(cmd, &self.handle)).is_err() {
             // We deliberately ignore the result of the send(): if the receiver was
             // dropped, we don't care if sending failed anyway.
             error!("Failed to send the spawn result back to the expect handle (receiver dropped)");

@@ -56,16 +56,15 @@ impl Client {
     }
 
     fn wait_for_exit_status(&mut self) {
-        return self.exit_status_rx
-                   .take()
-                    // Safe to unwrap, because exit_status_rx is consumed with shutdown_tx. If
-                    // shutdown_tx has not yet be consumed already, then exit_status_rx has not
-                    // been consumed either.
-                    .expect("internal error")
-                    .wait()
-                    // cannot fail because the session (and so the sender) is not dropped before
-                    // the exit status has been sent.
-                    .expect("failed to receive exit status from session");
+        self.exit_status_rx
+            .take()
+            // Safe to unwrap, because exit_status_rx is consumed with shutdown_tx. If shutdown_tx
+            // has not yet be consumed already, then exit_status_rx has not been consumed either.
+            .expect("internal error")
+            .wait()
+            // cannot fail because the session (and so the sender) is not dropped before the exit
+            // status has been sent.
+            .expect("failed to receive exit status from session");
     }
 }
 

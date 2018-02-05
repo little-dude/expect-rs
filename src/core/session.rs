@@ -116,7 +116,7 @@ impl Session {
 
     fn read_output(&mut self) -> Result<usize, io::Error> {
         debug!("reading from pty");
-        let mut buf = [0; 4096];
+        let mut buf = [0; 0x1000];
         let mut size = 0;
         loop {
             match self.pty.read(&mut buf[..]) {
@@ -231,7 +231,7 @@ impl Session {
             // safe to unwrap as shown by assert above
             let req = input_requests.pop_front().unwrap();
             // FIXME: should we return an error instead?
-            if let Err(_) = req.1.send(()) {
+            if req.1.send(()).is_err() {
                 error!("Cannot send input ack to client: the receiver was dropped already");
             }
         }
@@ -286,7 +286,7 @@ impl Session {
         *match_requests = unfinished_requests;
     }
 
-    pub fn spawn(cmd: Command, handle: Handle) -> Result<Client, SpawnError> {
+    pub fn spawn(cmd: Command, handle: &Handle) -> Result<Client, SpawnError> {
         debug!("spawning new command {:?}", cmd);
 
         // Chan used by the client to send input requests to the session when client.send() is
@@ -308,8 +308,8 @@ impl Session {
         // Create a new PTY and spawn the command, attaching its stdin, stdout and stderr to the
         // slave PTY. The master PTY's file descriptor get registered on the event loop so that we
         // can perform async reads and writes.
-        let mut pty = Pty::new::<::std::fs::File>(None, &handle).map_err(|e| SpawnError::Pty(e))?;
-        let child = pty.spawn(cmd).map_err(|e| SpawnError::SpawnCommand(e))?;
+        let mut pty = Pty::new::<::std::fs::File>(None, handle).map_err(SpawnError::Pty)?;
+        let child = pty.spawn(cmd).map_err(SpawnError::SpawnCommand)?;
 
         let session = Session {
             pty,

@@ -341,6 +341,43 @@ impl Session {
         }
     }
 
+    // FIXME: we should keep track of the processes until they are actually reaped. For now, we
+    // call wait_for_child but don't check its outcome, and expect the chil exited. In practice
+    // than does not work, because there is some time between the moment the process is killed and
+    // the moment its exit status is available. Calling `child.wait()` is not an option here
+    // because it blocks the current thread until it returns. I don't know if there's a way to
+    // register some kind of event with mio to poll the session again when the child's exit status
+    // is available. If not, we could have a future called periodically with a timer that keeps
+    // track of all the pending children...
+    fn wait_for_child(&mut self) -> Poll<(), ()> {
+        // first try to kill the process
+        if let Err(e) = self.child.kill() {
+            debug!("failed to kill child process: {}.", e);
+            debug!("it may have exited already");
+        } else {
+            debug!("child process killed");
+        }
+
+        drop(self.child.stdin.take());
+        drop(self.child.stdout.take());
+        drop(self.child.stderr.take());
+
+        match self.child.try_wait() {
+            Ok(None) => {
+                warn!("child process status is not available");
+                Ok(Async::NotReady)
+            }
+            Ok(Some(status)) => {
+                debug!("child process exited with status {}", status);
+                Ok(Async::Ready(()))
+            }
+            Err(e) => {
+                warn!("failed to check child status: {}", e);
+                Err(())
+            }
+        }
+    }
+
     /// Check whether the client asked the session to terminate
     fn should_exit(&mut self) -> bool {
         match self.shutdown_rx.poll() {
@@ -361,6 +398,8 @@ impl Future for Session {
         self.get_match_requests();
         self.process_match_requests();
         if self.should_exit() {
+            // FIXME: cf wait_for_child() above
+            self.wait_for_child();
             self.exit();
             Ok(Async::Ready(()))
         } else {

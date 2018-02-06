@@ -2,9 +2,12 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
+/// An error returned when initi [`Expect.init()`](../expect/struct.Expect.html#method.init) fails
 #[derive(Debug)]
 pub enum InitError {
+    /// Failed to start the event loop that manages the expect sessions
     Reactor(io::Error),
+    /// Failed to start the thread in which the event loop runs
     SpawnWorker(io::Error),
 }
 
@@ -33,6 +36,9 @@ impl fmt::Display for InitError {
     }
 }
 
+/// An error returned when sending input to the spawned process fails. See
+/// [`Client.send()`](../expect/struct.Client.html#method.send) and
+/// [`Client.send_line()`](../expect/struct.Client.html#method.send_line)
 #[derive(Debug)]
 pub enum SendError {
     ChanError,
@@ -58,11 +64,8 @@ impl fmt::Display for SendError {
 
 #[derive(Debug)]
 pub enum ExpectError {
-    /// No match found, and EOF reached while reading from the PTY
     Eof,
-    /// No match found, and timeout reached for the given match request
     Timeout,
-    ///
     Io(io::Error),
     ChanError,
 }
@@ -96,11 +99,17 @@ impl fmt::Display for ExpectError {
     }
 }
 
+/// Error returned when [`Expect.spawn()`](../expect/struct.Expect.html#method.spawn) fails.
 #[derive(Debug)]
 pub enum SpawnError {
+    /// Failed to created a PTY for the spawned process
     Pty(io::Error),
+    /// Failed to spawn the process
     SpawnCommand(io::Error),
-    Internal,
+    /// Failed to communicate with the worker that spawns should have spawned the process. This is
+    /// an internal error that is not recoverable. You probably won't be able to spend any more
+    /// expect session with the current handle.
+    NoEventLoop,
 }
 
 impl Error for SpawnError {
@@ -108,14 +117,14 @@ impl Error for SpawnError {
         match *self {
             SpawnError::Pty(_) => "failed to spawn a pty",
             SpawnError::SpawnCommand(_) => "failed to spawn the command",
-            SpawnError::Internal => "an error occured within the expect event loop",
+            SpawnError::NoEventLoop => "failed to send the spawn request to the event loop",
         }
     }
 
     fn cause(&self) -> Option<&Error> {
         match *self {
             SpawnError::Pty(ref e) | SpawnError::SpawnCommand(ref e) => Some(e),
-            SpawnError::Internal => None,
+            SpawnError::NoEventLoop => None,
         }
     }
 }

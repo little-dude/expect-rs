@@ -71,7 +71,7 @@ impl ExpectHandle {
         let request = (cmd, client_tx);
         self.spawn_tx
             .unbounded_send(request)
-            .map_err(|_| SpawnError::Internal)?;
+            .map_err(|_| SpawnError::NoEventLoop)?;
         client_rx
             .wait()
             .expect("failed to receive client from event loop")

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 fn main() {
     env_logger::init();
-    let mut expect = Expect::new().unwrap();
+    let mut expect = Expect::init().unwrap();
     let mut client = expect.spawn(Command::new("sh")).unwrap();
     client.match_string("$".into()).unwrap();
     client.send_line("whoami".into()).unwrap();
